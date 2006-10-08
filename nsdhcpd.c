@@ -176,20 +176,22 @@ typedef struct _dhcpDict {
     struct _dhcpDict *next;
 } DHCPDict;
 
-typedef union _dhcpValue {
-    u_int8_t u8;
-    u_int16_t u16;
-    int16_t s16;
-    u_int32_t u32;
-    int32_t s32;
-    u_int8_t *str;
-} DHCPValue;
-
 typedef struct _dhcpOption {
-    DHCPValue *value;
+    u_int8_t *value;
     u_int8_t size;
     DHCPDict *dict;
 } DHCPOption;
+
+typedef struct _dhcpRange {
+    struct _dhcpRange *next;
+    DHCPOption *match;
+    DHCPOption *reply;
+    u_int32_t gateway;
+    u_int32_t netmask;
+    u_int32_t start;
+    u_int32_t end;
+    u_int32_t lease_time;
+} DHCPRange;
 
 typedef struct _dhcpServer {
     int port;
@@ -205,6 +207,8 @@ typedef struct _dhcpServer {
       int sock;
       int port;
     } client;
+    Ns_Mutex lock;
+    DHCPRange *ranges;
 } DHCPServer;
 
 typedef struct _dhcpPacket {
@@ -215,10 +219,10 @@ typedef struct _dhcpPacket {
     u_int32_t xid;
     u_int16_t secs;
     u_int16_t flags;
-    u_int32_t cipaddr;
-    u_int32_t yipaddr;
-    u_int32_t sipaddr;
-    u_int32_t gipaddr;
+    u_int32_t ciaddr;
+    u_int32_t yiaddr;
+    u_int32_t siaddr;
+    u_int32_t giaddr;
     u_int8_t macaddr[16];
     u_int8_t sname[64];
     u_int8_t file[128];
@@ -237,8 +241,8 @@ typedef struct _dhcpRequest {
     u_int8_t msgtype;
     struct {
       u_int8_t msgtype;
-      u_int32_t yipaddr;
-      u_int32_t sipaddr;
+      u_int32_t yiaddr;
+      u_int32_t siaddr;
       u_int32_t netmask;
       u_int32_t gateway;
       u_int32_t broadcast;
@@ -264,10 +268,11 @@ static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int
 static void DHCPPrintValue(Ns_DString *ds, char *name, u_int8_t type, u_int8_t size, u_int8_t *data);
 static int DHCPRequestSend(DHCPRequest *req, u_int32_t ipaddr, int port);
 static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, SOCKET sock, char *buffer, int size, struct sockaddr_in *sa);
+static void DHCPProcessDiscover(DHCPRequest *req);
+static void DHCPProcessRequest(DHCPRequest *req);
+static void DHCPProcessInform(DHCPRequest *req);
 static void DHCPSend(DHCPRequest *req, u_int8_t type);
-static void DHCPOffer(DHCPRequest *req);
-static void DHCPACK(DHCPRequest *req);
-static void DHCPNAK(DHCPRequest *req);
+static void DHCPSendNAK(DHCPRequest *req);
 static char *addr2str(u_int32_t addr);
 static char *bin2hex(char *buf, u_int8_t *macaddr, int numbytes);
 static u_int8_t *getOption(DHCPPacket *pkt, u_int8_t code, u_int8_t subcode, DHCPOption *val);
@@ -279,8 +284,9 @@ static void addOptionIP(DHCPRequest *req, u_int8_t code, u_int32_t ipaddr);
 static DHCPDict *getDict(const char *name);
 static u_int8_t getType(const char *type);
 static const char *getTypeName(u_int8_t type);
-static const char *getMessageName(u_int8_t type);
 static u_int8_t getTypeSize(u_int8_t type);
+static u_int8_t getMessage(const char *name);
+static const char *getMessageName(u_int8_t type);
 
 static Ns_Tls reqTls;
 
@@ -289,9 +295,6 @@ static DHCPDict agent_dict[256] = {
     { "remote-id",                     OPTION_STRING,				 2,          82,  0 },
     { "agent-id",                      OPTION_IPADDR,				 3,          82,  0 },
     { "docsis-device-class",           OPTION_U32,     			         4,          82,  0 },
-};
-
-static DHCPDict fqdn_dict[256] = {
 };
 
 static DHCPDict main_dict[256] = {
@@ -376,7 +379,7 @@ static DHCPDict main_dict[256] = {
     { "slp-directory-agent",           OPTION_STRING,			         78,         0,   0 },
     { "slp-service-scope",             OPTION_STRING,			         79,         0,   0 },
     { "option-80",                     OPTION_STRING,				 80,         0,   0 },
-    { "fqdn",                          OPTION_STRING,				 81,         0,   fqdn_dict },
+    { "fqdn",                          OPTION_STRING,				 81,         0,   0 },
     { "agent",                         OPTION_STRING,		                 82,         0,   agent_dict },
     { "option-83",                     OPTION_STRING,				 83,         0,   0 },
     { "option-84",                     OPTION_STRING,				 84,         0,   0 },
@@ -601,10 +604,10 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     srvPtr->name = server;
     srvPtr->debug = Ns_ConfigIntRange(path, "debug", 0, 0, 65535);
     srvPtr->port = Ns_ConfigIntRange(path, "port", 67, 1, 65535);
-    srvPtr->client.port = Ns_ConfigIntRange(path, "client_port", 68, 1, 65535);
     srvPtr->proc = Ns_ConfigGetValue(path, "proc");
     srvPtr->address = Ns_ConfigGetValue(path, "address");
     srvPtr->drivermode = Ns_ConfigBool(path, "drivermode", 1);
+    srvPtr->client.port = Ns_ConfigIntRange(path, "client_port", 68, 1, 65535);
 
     if ((Ns_GetSockAddr(&srvPtr->ipaddr, srvPtr->address, srvPtr->port) == NS_ERROR ||
          !strcmp(ns_inet_ntoa(srvPtr->ipaddr.sin_addr), "0.0.0.0")) &&
@@ -699,10 +702,12 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
     Ns_DString ds;
 
     enum {
-        cmdDebug, cmdDictGet, cmdSend, cmdReqGet, cmdReqSet, cmdReqList
+        cmdDebug, cmdDictGet, cmdSend, cmdReqGet, cmdReqSet, cmdReqList,
+        cmdRangeAdd
     };
     static CONST char *subcmd[] = {
         "debug", "dictget", "send", "reqget", "reqset", "reqlist",
+        "rangeadd",
         NULL
     };
 
@@ -804,6 +809,11 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         break;
     }
 
+    case cmdRangeAdd:
+        Ns_MutexLock(&srvPtr->lock);
+        Ns_MutexUnlock(&srvPtr->lock);
+        break;
+
     case cmdDictGet:
         if (objc < 3) {
             Tcl_WrongNumArgs(interp, 2, objv, "name");
@@ -828,7 +838,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             return TCL_ERROR;
         }
         Ns_DStringInit(&ds);
-        if (!strcmp(Tcl_GetString(objv[2]), "msgtype")) {
+        if (!strcmp(Tcl_GetString(objv[2]), "type")) {
             Ns_DStringPrintf(&ds, "%s", getMessageName(req->msgtype));
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "id")) {
@@ -836,11 +846,23 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "ipaddr")) {
             Ns_DStringAppend(&ds, ns_inet_ntoa(req->sa.sin_addr));
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "yiaddr")) {
+            Ns_DStringAppend(&ds, addr2str(req->in.yiaddr));
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "siaddr")) {
+            Ns_DStringAppend(&ds, addr2str(req->in.siaddr));
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "giaddr")) {
+            Ns_DStringAppend(&ds, addr2str(req->in.giaddr));
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "ciaddr")) {
+            Ns_DStringAppend(&ds, addr2str(req->in.ciaddr));
         } else {
             dict = getDict(Tcl_GetString(objv[2]));
             if (dict != NULL && getOption(&req->in, dict->parent ? dict->parent : dict->code,
                                                     dict->parent ? dict->code : 0, &option) != NULL) {
-                DHCPPrintValue(&ds, option.dict->name, option.dict->flags & 0x00ff, option.size, option.value->str);
+                DHCPPrintValue(&ds, option.dict->name, option.dict->flags & 0x00ff, option.size, option.value);
             }
         }
         Tcl_AppendResult(interp, ds.string, 0);
@@ -853,9 +875,32 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             break;
         }
         for (i = 2; i < objc - 1; i += 2) {
-            if (!strcasecmp(Tcl_GetString(objv[i]), "msgtype")) {
-                req->reply.msgtype = atoi(Tcl_GetString(objv[i+1]));
-            } else {
+            if (!strcasecmp(Tcl_GetString(objv[i]), "type")) {
+                req->reply.msgtype = getMessage(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "yiaddr")) {
+                req->in.yiaddr = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "siaddr")) {
+                req->in.siaddr = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "giaddr")) {
+                req->in.giaddr = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "ciaddr")) {
+                req->in.ciaddr = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "network")) {
+                req->reply.netmask = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "broadcast")) {
+                req->reply.broadcast = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "gateway")) {
+                req->reply.gateway = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "lease_time")) {
+                req->reply.lease_time = atol(Tcl_GetString(objv[i+1]));
             }
         }
         break;
@@ -1114,39 +1159,53 @@ static int DHCPRequestProcess(DHCPRequest *req)
         Ns_DStringFree(&ds);
     }
 
-    Ns_TlsSet(&reqTls, req);
-
     if (req->srvPtr->proc != NULL) {
         Tcl_Interp *interp = Ns_TclAllocateInterp(req->srvPtr->name);
+
+        Ns_TlsSet(&reqTls, req);
         if (Tcl_EvalEx(interp, req->srvPtr->proc, -1, 0) != TCL_OK) {
             Ns_TclLogError(interp);
         }
         Ns_TclDeAllocateInterp(interp);
+        Ns_TlsSet(&reqTls, 0);
+
+        /* Script set reply code, we assume we are ready to return reply packet */
+        switch (req->reply.msgtype) {
+         case DHCP_ACK:
+         case DHCP_OFFER:
+             DHCPSend(req, DHCP_ACK);
+             return NS_TRUE;
+
+         case DHCP_NAK:
+             DHCPSendNAK(req);
+             return NS_TRUE;
+        }
     }
 
     switch (req->msgtype) {
     case DHCP_DISCOVER:
-    	DHCPOffer(req);
+    	DHCPProcessDiscover(req);
     	break;
 
     case DHCP_REQUEST:
-    	DHCPACK(req);
+    	DHCPProcessRequest(req);
     	break;
 
     case DHCP_INFORM:
-    	DHCPACK(req);
+    	DHCPProcessInform(req);
     	break;
 
     case DHCP_RELEASE:
+        break;
+
     case DHCP_ACK:
-    case DHCP_OFFER:
     case DHCP_NAK:
+    case DHCP_OFFER:
         break;
 
     default:
     	Ns_Log(Debug, "nsdhcpd: unsupported msg type (%d) %s -- ignoring", req->msgtype, bin2hex(req->buffer, req->in.macaddr, 6));
     }
-    Ns_TlsSet(&reqTls, 0);
     return NS_TRUE;
 }
 
@@ -1180,18 +1239,18 @@ static int DHCPRequestReply(DHCPRequest *req)
     struct sockaddr_in sa;
     int	size, port = 68;
 
-    if (req->out.gipaddr) {
+    if (req->out.giaddr) {
         port = 67;
-        ipaddr = req->out.gipaddr;
+        ipaddr = req->out.giaddr;
     } else {
-        if (req->out.cipaddr) {
-            ipaddr = req->out.cipaddr;
+        if (req->out.ciaddr) {
+            ipaddr = req->out.ciaddr;
         } else
         if (ntohs(req->in.flags) & BROADCAST_FLAG) {
             ipaddr = INADDR_BROADCAST;
         } else
-        if (req->out.yipaddr) {
-            ipaddr = req->out.yipaddr;
+        if (req->out.yiaddr) {
+            ipaddr = req->out.yiaddr;
         } else {
             ipaddr = req->sa.sin_addr.s_addr;
         }
@@ -1225,10 +1284,10 @@ static void DHCPPrintRequest(Ns_DString *ds, DHCPRequest *req, int reply)
 
     Ns_DStringPrintf(ds, "type %s from %s:%d hops %d flags %x xid %u ", getMessageName(type ? *type : 0),
                      ns_inet_ntoa(req->sa.sin_addr), ntohs(req->sa.sin_port), pkt->hops, pkt->flags, pkt->xid);
-    Ns_DStringPrintf(ds, "yiaddr %s ", addr2str(pkt->yipaddr));
-    Ns_DStringPrintf(ds, "ciaddr %s ", addr2str(pkt->cipaddr));
-    Ns_DStringPrintf(ds, "giaddr %s ", addr2str(pkt->gipaddr));
-    Ns_DStringPrintf(ds, "siaddr %s ", addr2str(pkt->sipaddr));
+    Ns_DStringPrintf(ds, "yiaddr %s ", addr2str(pkt->yiaddr));
+    Ns_DStringPrintf(ds, "ciaddr %s ", addr2str(pkt->ciaddr));
+    Ns_DStringPrintf(ds, "giaddr %s ", addr2str(pkt->giaddr));
+    Ns_DStringPrintf(ds, "siaddr %s ", addr2str(pkt->siaddr));
     Ns_DStringPrintf(ds, "macaddr %02x:%02x:%02x:%02x:%02x:%02x ", pkt->macaddr[0], pkt->macaddr[1], pkt->macaddr[2],
                      pkt->macaddr[3], pkt->macaddr[4], pkt->macaddr[5]);
     DHCPPrintOptions(ds, pkt, pkt->options, OPTION_SIZE, main_dict);
@@ -1329,10 +1388,10 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
     req->out.xid = req->in.xid;
     req->out.hops = req->in.hops;
     req->out.flags = req->in.flags;
-    req->out.cipaddr = req->in.cipaddr;
-    req->out.gipaddr = req->in.gipaddr;
-    req->out.yipaddr = req->reply.yipaddr;
-    req->out.sipaddr = req->reply.sipaddr;
+    req->out.ciaddr = req->in.ciaddr;
+    req->out.giaddr = req->in.giaddr;
+    req->out.yiaddr = req->reply.yiaddr;
+    req->out.siaddr = req->reply.siaddr;
     req->out.cookie = htonl(DHCP_MAGIC);
     memcpy(req->out.macaddr, req->in.macaddr, 6);
 
@@ -1368,21 +1427,26 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
     DHCPRequestReply(req);
 }
 
-/* send a DHCP OFFER to a DHCP DISCOVER */
-static void DHCPOffer(DHCPRequest *req)
+static void DHCPProcessDiscover(DHCPRequest *req)
 {
     DHCPSend(req, DHCP_OFFER);
 }
 
-/* send a DHCP ACK to a DHCP REQUEST */
-static void DHCPACK(DHCPRequest *req)
+static void DHCPProcessRequest(DHCPRequest *req)
 {
-    req->reply.yipaddr = req->in.yipaddr;
-    req->reply.sipaddr = req->in.sipaddr;
+    req->reply.yiaddr = req->in.yiaddr;
+    req->reply.siaddr = req->in.siaddr;
     DHCPSend(req, DHCP_ACK);
 }
 
-static void DHCPNAK(DHCPRequest *req)
+static void DHCPProcessInform(DHCPRequest *req)
+{
+    req->reply.yiaddr = req->in.yiaddr;
+    req->reply.siaddr = req->in.siaddr;
+    DHCPSend(req, DHCP_ACK);
+}
+
+static void DHCPSendNAK(DHCPRequest *req)
 {
     req->out.op = BOOTREPLY;
     req->out.htype = ETH_10MB;
@@ -1390,8 +1454,8 @@ static void DHCPNAK(DHCPRequest *req)
     req->out.xid = req->in.xid;
     req->out.hops = req->in.hops;
     req->out.flags = req->in.flags;
-    req->out.cipaddr = req->in.cipaddr;
-    req->out.gipaddr = req->in.gipaddr;
+    req->out.ciaddr = req->in.ciaddr;
+    req->out.giaddr = req->in.giaddr;
     req->out.cookie = htonl(DHCP_MAGIC);
     memcpy(req->out.macaddr, req->in.macaddr, 6);
 
@@ -1496,6 +1560,18 @@ static const char *getMessageName(u_int8_t type)
          }
     }
     return "unknown";
+}
+
+static u_int8_t getMessage(const char *name)
+{
+    int i;
+
+    for (i = 0; msgtypes[i].key; i++) {
+         if (!strcasecmp(msgtypes[i].key, name)) {
+             return msgtypes[i].value;
+         }
+    }
+    return 0;
 }
 
 static const char *getTypeName(u_int8_t type)
@@ -1609,7 +1685,7 @@ static u_int8_t *getOption(DHCPPacket *pkt, u_int8_t code, u_int8_t subcode, DHC
               }
               if (opt) {
                   opt->size = size;
-                  opt->value = (DHCPValue*)(ptr + i + OFFSET_DATA);
+                  opt->value = ptr + i + OFFSET_DATA;
                   opt->dict = &dict[code];
               }
               return ptr + i + OFFSET_DATA;
