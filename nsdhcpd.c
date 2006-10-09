@@ -172,7 +172,7 @@ typedef struct _dhcpDict {
     char *name;
     int flags;
     int code;
-    int parent;
+    int subcode;
     struct _dhcpDict *next;
 } DHCPDict;
 
@@ -180,11 +180,13 @@ typedef struct _dhcpOption {
     struct _dhcpOption *next;
     DHCPDict *dict;
     u_int8_t size;
+    u_int8_t *ptr;
     union {
       u_int8_t u8;
+      int16_t s16;
       u_int16_t u16;
+      int32_t s32;
       u_int32_t u32;
-      u_int8_t *str;
     } value;
 } DHCPOption;
 
@@ -192,12 +194,12 @@ typedef struct _dhcpRange {
     struct _dhcpRange *next;
     DHCPOption *check;
     DHCPOption *reply;
-    u_int32_t gateway;
-    u_int32_t netmask;
     u_int32_t start;
     u_int32_t end;
-    u_int32_t lease_time;
     char macaddr[13];
+    u_int32_t lease_time;
+    Tcl_HashTable leases;
+    Ns_Mutex lock;
 } DHCPRange;
 
 typedef struct _dhcpLease {
@@ -223,10 +225,6 @@ typedef struct _dhcpServer {
     } client;
     Ns_Mutex lock;
     DHCPRange *ranges;
-    struct {
-      Tcl_HashTable ipaddr;
-      Tcl_HashTable macaddr;
-    } leases;
 } DHCPServer;
 
 typedef struct _dhcpPacket {
@@ -257,6 +255,7 @@ typedef struct _dhcpRequest {
     int size;
     char *buffer;
     u_int8_t msgtype;
+    DHCPRange *range;
     struct {
       u_int8_t msgtype;
       u_int32_t yiaddr;
@@ -264,8 +263,8 @@ typedef struct _dhcpRequest {
       u_int32_t netmask;
       u_int32_t gateway;
       u_int32_t broadcast;
+      u_int32_t nameserver;
       u_int32_t lease_time;
-      DHCPRange *range;
     } reply;
     struct {
       u_int8_t *ptr;
@@ -293,9 +292,15 @@ static void DHCPProcessInform(DHCPRequest *req);
 static void DHCPProcessRelease(DHCPRequest *req);
 static void DHCPSend(DHCPRequest *req, u_int8_t type);
 static void DHCPSendNAK(DHCPRequest *req);
+static DHCPRange *DHCPRangeFind(DHCPRequest *req);
+static DHCPRange *DHCPRangeFindFast(DHCPServer *srvPtr, u_int32_t ipaddr);
+static int DHCPRangeAlloc(DHCPRequest *req);
 static void DHCPRangeFree(DHCPRange *range);
-static DHCPLease *DHCPLeaseAdd(DHCPServer *srvPtr, char *macaddr, u_int32_t ipaddr, u_int32_t lease_time, u_int32_t expires);
-static void DHCPLeaseDel(DHCPServer *srvPtr, char *macaddr);
+static DHCPLease *DHCPLeaseCreate(u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires);
+static DHCPLease *DHCPLeaseFind(DHCPRange *range, char *macaddr, u_int32_t ipaddr);
+static int DHCPLeaseAdd(DHCPRange *range, DHCPLease *lease);
+static void DHCPLeaseList(DHCPRange *range, Ns_DString *ds);
+static void DHCPLeaseDel(DHCPRange *range, u_int32_t ipaddr);
 static char *addr2str(u_int32_t addr);
 static char *str2mac(char *macaddr, char *str);
 static char *bin2hex(char *buf, u_int8_t *macaddr, int numbytes);
@@ -307,19 +312,19 @@ static void addOption16(DHCPRequest *req, u_int8_t code, u_int16_t data);
 static void addOption32(DHCPRequest *req, u_int8_t code, u_int32_t data);
 static void addOptionIP(DHCPRequest *req, u_int8_t code, u_int32_t ipaddr);
 static DHCPDict *getDict(const char *name);
-static u_int8_t getType(const char *type);
+static u_int8_t getTypeID(const char *type);
 static const char *getTypeName(u_int8_t type);
 static u_int8_t getTypeSize(u_int8_t type);
-static u_int8_t getMessage(const char *name);
+static u_int8_t getMessageID(const char *name);
 static const char *getMessageName(u_int8_t type);
 
 static Ns_Tls reqTls;
 
 static DHCPDict agent_dict[256] = {
-    { "agent.circuit-id",             OPTION_STRING,				 1,          82,  0 },
-    { "agent.remote-id",              OPTION_STRING,				 2,          82,  0 },
-    { "agent.agent-id",               OPTION_IPADDR,				 3,          82,  0 },
-    { "agent.docsis-device-class",    OPTION_U32,     			         4,          82,  0 },
+    { "agent.circuit-id",             OPTION_STRING,				 82,          1,  0 },
+    { "agent.remote-id",              OPTION_STRING,				 82,          2,  0 },
+    { "agent.agent-id",               OPTION_IPADDR,				 82,          3,  0 },
+    { "agent.docsis-device-class",    OPTION_U32,     			         82,          4,  0 },
 };
 
 static DHCPDict main_dict[256] = {
@@ -593,6 +598,23 @@ static Ns_ObjvTable msgtypes[] = {
     { NULL,       0 }
 };
 
+static struct {
+    char *key;
+    u_int8_t type;
+    u_int8_t size;
+} opttypes[] = {
+    { "unknown", 0,              0 },
+    { "ipaddr",  OPTION_IPADDR,  4 },
+    { "boolean", OPTION_BOOLEAN, 1 },
+    { "ubyte",   OPTION_U8,      1 },
+    { "short",   OPTION_S16,     2 },
+    { "ushort",  OPTION_U16,     2 },
+    { "uint",    OPTION_U32,     4 },
+    { "int",     OPTION_S32,     4 },
+    { "string",  OPTION_STRING,  1 },
+    { NULL,      0 ,             0 }
+};
+
 NS_EXPORT int Ns_ModuleVersion = 1;
 
 /*
@@ -669,9 +691,6 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
                    srvPtr->proc ? srvPtr->proc : "");
     }
 
-    Tcl_InitHashTable(&srvPtr->leases.macaddr, TCL_STRING_KEYS);
-    Tcl_InitHashTable(&srvPtr->leases.ipaddr, TCL_ONE_WORD_KEYS);
-
     /*
      * Client socket if we will need to receive DHCP replies in send command
      */
@@ -725,13 +744,10 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
     DHCPServer *srvPtr = (DHCPServer *) arg;
     char macaddr[13];
     int i, status, cmd;
-    Tcl_HashEntry *entry;
-    Tcl_HashSearch search;
     DHCPDict *dict;
     DHCPRange *range;
     DHCPOption *opt, option;
     DHCPRequest *req;
-    DHCPLease *lease;
     Ns_DString ds;
 
     enum {
@@ -844,30 +860,32 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
 
     case cmdLeaseAdd:
         if (objc < 6) {
-            Tcl_WrongNumArgs(interp, 2, objv, "macaddr ipaddr leasetime expires");
+            Tcl_WrongNumArgs(interp, 2, objv, "ipaddr macaddr leasetime expires");
             return TCL_ERROR;
         }
-        str2mac(macaddr, Tcl_GetString(objv[2]));
-        DHCPLeaseAdd(srvPtr, macaddr, inet_addr(Tcl_GetString(objv[3])), atoi(Tcl_GetString(objv[4])), atoi(Tcl_GetString(objv[5])));
+        str2mac(macaddr, Tcl_GetString(objv[3]));
+        range = DHCPRangeFindFast(srvPtr, inet_addr(Tcl_GetString(objv[2])));
+        if (range != NULL) {
+            DHCPLeaseAdd(range, DHCPLeaseCreate(inet_addr(Tcl_GetString(objv[3])), macaddr, atoi(Tcl_GetString(objv[4])), atoi(Tcl_GetString(objv[5]))));
+        }
         break;
 
     case cmdLeaseDel:
         if (objc < 3) {
-            Tcl_WrongNumArgs(interp, 2, objv, "macaddr");
+            Tcl_WrongNumArgs(interp, 2, objv, "ipaddr");
             return TCL_ERROR;
         }
-        str2mac(macaddr, Tcl_GetString(objv[2]));
-        DHCPLeaseDel(srvPtr, macaddr);
+        range = DHCPRangeFindFast(srvPtr, inet_addr(Tcl_GetString(objv[2])));
+        if (range != NULL) {
+            DHCPLeaseDel(range, inet_addr(Tcl_GetString(objv[2])));
+        }
         break;
 
     case cmdLeaseList:
         Ns_DStringInit(&ds);
         Ns_MutexLock(&srvPtr->lock);
-        entry = Tcl_FirstHashEntry(&srvPtr->leases.macaddr, &search);
-        while (entry) {
-            lease = (DHCPLease*)Tcl_GetHashValue(entry);
-            Ns_DStringPrintf(&ds, "%s %s %u %u ", lease->macaddr, addr2str(lease->ipaddr), lease->lease_time, lease->expires);
-            entry = Tcl_NextHashEntry(&search);
+        for (range = srvPtr->ranges; range; range = range->next) {
+             DHCPLeaseList(range, &ds);
         }
         Ns_MutexUnlock(&srvPtr->lock);
         Tcl_AppendResult(interp, ds.string, NULL);
@@ -882,8 +900,6 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         for (range = srvPtr->ranges; range; range = range->next) {
             Ns_DStringPrintf(&ds, "%s ", addr2str(range->start));
             Ns_DStringPrintf(&ds, "%s ", addr2str(range->end));
-            Ns_DStringPrintf(&ds, "%s ", addr2str(range->netmask));
-            Ns_DStringPrintf(&ds, "%s ", addr2str(range->gateway));
             Ns_DStringPrintf(&ds, "%s ", range->macaddr);
             options[0] = range->check;
             options[1] = range->reply;
@@ -912,7 +928,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
                         break;
 
                     default:
-                        Ns_DStringPrintf(&ds, "{%s} ", opt->value.str);
+                        Ns_DStringPrintf(&ds, "{%s} ", opt->ptr);
                     }
                 }
                 Ns_DStringAppend(&ds, "} ");
@@ -928,20 +944,18 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         int j, argc;
         CONST char **argv;
         char *options[2] = { NULL, NULL };
-        char *macaddr = NULL, *start, *end, *netmask, *gateway;
+        char *macaddr = NULL, *start, *end;
 
         Ns_ObjvSpec raOpts[] = {
-            {"-check",  Ns_ObjvString, &options[0], NULL },
-            {"-reply",  Ns_ObjvString, &options[1], NULL },
-            {"-macaddr",Ns_ObjvString, &macaddr,    NULL },
-            {"--",      Ns_ObjvBreak,  NULL,        NULL },
+            {"-check",      Ns_ObjvString, &options[0],  NULL },
+            {"-reply",      Ns_ObjvString, &options[1],  NULL },
+            {"-macaddr",    Ns_ObjvString, &macaddr,     NULL },
+            {"--",          Ns_ObjvBreak,  NULL,         NULL },
             {NULL, NULL, NULL, NULL}
         };
         Ns_ObjvSpec raArgs[] = {
             {"start",   Ns_ObjvString, &start,   NULL },
             {"end",     Ns_ObjvString, &end,     NULL },
-            {"netmask", Ns_ObjvString, &netmask, NULL },
-            {"gateway", Ns_ObjvString, &gateway, NULL },
             {NULL, NULL, NULL, NULL}
         };
 
@@ -952,10 +966,14 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         range = (DHCPRange*)ns_calloc(1, sizeof(DHCPRange));
         range->start = inet_addr(start);
         range->end = inet_addr(end);
-        range->netmask = inet_addr(netmask);
-        range->gateway = inet_addr(gateway);
+        Tcl_InitHashTable(&range->leases, TCL_ONE_WORD_KEYS);
         if (macaddr != NULL) {
            str2mac(range->macaddr, macaddr);
+        }
+        if (range->end < range->start) {
+            ns_free(range);
+            Tcl_AppendResult(interp, "start less than end", NULL);
+            return TCL_ERROR;
         }
         for (j = 0; j < 2; j++) {
             if (options[j] == NULL) {
@@ -1008,7 +1026,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
                     break;
 
                 default:
-                    opt->value.str = (u_int8_t*)ns_strdup(argv[i+1]);
+                    opt->ptr = (u_int8_t*)ns_strdup(argv[i+1]);
                     opt->size = strlen(argv[i+1]);
                 }
             }
@@ -1032,6 +1050,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         if (dict != NULL) {
             Tcl_Obj *obj = Tcl_NewListObj(0, 0);
             Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(dict->code));
+            Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(dict->subcode));
             Tcl_ListObjAppendElement(interp, obj, Tcl_NewStringObj(getTypeName(dict->flags), -1));
             Tcl_SetObjResult(interp, obj);
         }
@@ -1068,10 +1087,10 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         if (!strcmp(Tcl_GetString(objv[2]), "ciaddr")) {
             Ns_DStringAppend(&ds, addr2str(req->in.ciaddr));
         } else {
+            u_int8_t *ptr;
             dict = getDict(Tcl_GetString(objv[2]));
-            if (dict != NULL && getOption(&req->in, dict->parent ? dict->parent : dict->code,
-                                                    dict->parent ? dict->code : 0, &option) != NULL) {
-                DHCPPrintValue(&ds, option.dict->name, option.dict->flags & 0x00ff, option.size, option.value.str);
+            if (dict != NULL && (ptr = getOption(&req->in, dict->code, dict->subcode, &option)) != NULL) {
+                DHCPPrintValue(&ds, option.dict->name, option.dict->flags, option.size, ptr);
             }
         }
         Tcl_AppendResult(interp, ds.string, 0);
@@ -1085,7 +1104,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         }
         for (i = 2; i < objc - 1; i += 2) {
             if (!strcasecmp(Tcl_GetString(objv[i]), "type")) {
-                req->reply.msgtype = getMessage(Tcl_GetString(objv[i+1]));
+                req->reply.msgtype = getMessageID(Tcl_GetString(objv[i+1]));
             } else
             if (!strcmp(Tcl_GetString(objv[i]), "yiaddr")) {
                 req->in.yiaddr = inet_addr(Tcl_GetString(objv[i+1]));
@@ -1107,6 +1126,9 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             } else
             if (!strcmp(Tcl_GetString(objv[i]), "gateway")) {
                 req->reply.gateway = inet_addr(Tcl_GetString(objv[i+1]));
+            } else
+            if (!strcmp(Tcl_GetString(objv[i]), "nameserver")) {
+                req->reply.nameserver = inet_addr(Tcl_GetString(objv[i+1]));
             } else
             if (!strcmp(Tcl_GetString(objv[i]), "lease_time")) {
                 req->reply.lease_time = atol(Tcl_GetString(objv[i+1]));
@@ -1509,42 +1531,42 @@ static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int
     int i = 0, size, code, over = 0, mode = OPTION_FIELD;
 
     while (i < length) {
-          code = ptr[i + OFFSET_CODE];
-          size = ptr[i + OFFSET_LEN];
-          switch (code) {
-          case DHCP_PADDING:
-               i++;
-               break;
+        code = ptr[i + OFFSET_CODE];
+        size = ptr[i + OFFSET_LEN];
+        switch (code) {
+        case DHCP_PADDING:
+             i++;
+             break;
 
-          case DHCP_OPTION_OVERLOAD:
-               if (i + 1 + size >= length) {
-                   Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i, length);
-                   return;
-               }
-               over = ptr[i + 3];
-               i += ptr[OFFSET_LEN] + 2;
-               break;
+        case DHCP_OPTION_OVERLOAD:
+             if (i + 1 + size >= length) {
+                 Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i, length);
+                 return;
+             }
+             over = ptr[i + 3];
+             i += ptr[OFFSET_LEN] + 2;
+             break;
 
-          case DHCP_END:
-               if (mode == OPTION_FIELD && over & FILE_FIELD) {
-                   Ns_DStringPrintf(ds, "file %s ", pkt->file);
-               } else
-               if (mode == FILE_FIELD && over & SNAME_FIELD) {
-                   Ns_DStringPrintf(ds, "sname %s ", pkt->sname);
-               }
-               return;
+        case DHCP_END:
+             if (mode == OPTION_FIELD && over & FILE_FIELD) {
+                 Ns_DStringPrintf(ds, "file %s ", pkt->file);
+             } else
+             if (mode == FILE_FIELD && over & SNAME_FIELD) {
+                 Ns_DStringPrintf(ds, "sname %s ", pkt->sname);
+             }
+             return;
 
-          default:
-               if (i + 1 + size >= length) {
-                   Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i + 1 + size, length);
-                   return;
-               }
-               if (info[code].next != NULL) {
-                   DHCPPrintOptions(ds, pkt, ptr + i + OFFSET_DATA, size, info[code].next);
-               }
-               DHCPPrintValue(ds, info[code].name, info[code].flags & 0x00FF, size, ptr + i + OFFSET_DATA);
-               i += size + 2;
-          }
+        default:
+             if (i + 1 + size >= length) {
+                 Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i + 1 + size, length);
+                 return;
+             }
+             if (info[code].next != NULL) {
+                 DHCPPrintOptions(ds, pkt, ptr + i + OFFSET_DATA, size, info[code].next);
+             }
+             DHCPPrintValue(ds, info[code].name, info[code].flags, size, ptr + i + OFFSET_DATA);
+             i += size + 2;
+        }
     }
 }
 
@@ -1552,31 +1574,56 @@ static void DHCPPrintValue(Ns_DString *ds, char *name, u_int8_t type, u_int8_t s
 {
     char buf[256];
 
-    switch (type) {
-    case OPTION_IPADDR:
-        Ns_DStringPrintf(ds, "%s %s ", name, addr2str(*((u_int32_t*)(data))));
-        break;
-    case OPTION_BOOLEAN:
-        Ns_DStringPrintf(ds, "%s %d ", name, *data);
-        break;
-    case OPTION_U8:
-        Ns_DStringPrintf(ds, "%s %d ", name, *data);
-        break;
-    case OPTION_S16:
-        Ns_DStringPrintf(ds, "%s %d ", name, ntohs(*((int16_t*)(data))));
-        break;
-    case OPTION_U16:
-        Ns_DStringPrintf(ds, "%s %d ", name, ntohs(*((u_int16_t*)(data))));
-        break;
-    case OPTION_U32:
-        Ns_DStringPrintf(ds, "%s %d ", name, ntohl(*((u_int32_t*)(data))));
-        break;
-    case OPTION_S32:
-        Ns_DStringPrintf(ds, "%s %u ", name, ntohl(*((int32_t*)(data))));
-        break;
-    default:
-        Ns_DStringPrintf(ds, "%s {%s} ", name, bin2hex(buf, data, size));
-        break;
+    Ns_DStringPrintf(ds, "%s ", name);
+    while (size > 0) {
+        switch (type & 0x00ff) {
+        case OPTION_IPADDR:
+            Ns_DStringPrintf(ds, "%s ", addr2str(*((u_int32_t*)(data))));
+            size -= 4;
+            data += 4;
+            break;
+
+        case OPTION_BOOLEAN:
+            Ns_DStringPrintf(ds, "%d ", *data);
+            size -= 1;
+            data += 1;
+            break;
+
+        case OPTION_U8:
+            Ns_DStringPrintf(ds, "%d ", *data);
+            size -= 1;
+            data += 1;
+            break;
+
+        case OPTION_S16:
+            Ns_DStringPrintf(ds, "%d ", ntohs(*((int16_t*)(data))));
+            size -= 2;
+            data += 2;
+            break;
+
+        case OPTION_U16:
+            Ns_DStringPrintf(ds, "%d ", ntohs(*((u_int16_t*)(data))));
+            size -= 2;
+            data += 2;
+            break;
+
+        case OPTION_U32:
+            Ns_DStringPrintf(ds, "%d ", ntohl(*((u_int32_t*)(data))));
+            size -= 4;
+            data += 4;
+            break;
+
+        case OPTION_S32:
+            Ns_DStringPrintf(ds, "%u ", ntohl(*((int32_t*)(data))));
+            size -= 4;
+            data += 4;
+            break;
+
+        default:
+            Ns_DStringPrintf(ds, "{%s} ", bin2hex(buf, data, size));
+            size = 0;
+            break;
+        }
     }
 }
 
@@ -1620,18 +1667,15 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
         addOption32(req, DHCP_BROADCAST_ADDRESS, req->reply.broadcast);
     }
     if (req->reply.lease_time) {
-        int lease_time;
+        int lease_time = req->reply.lease_time / 2;
         addOption32(req, DHCP_LEASE_TIME, req->reply.lease_time);
-        lease_time = req->reply.lease_time - 15;
-        if (lease_time < 0) {
-            lease_time = 5;
-        }
         addOption32(req, DHCP_RENEWAL_TIME, lease_time);
+        lease_time = req->reply.lease_time / 2 + req->reply.lease_time / 4;
         addOption32(req, DHCP_REBINDING_TIME, lease_time);
     }
     // Options from the range found
-    if (req->reply.range) {
-        for (opt = req->reply.range->reply; opt; opt = opt->next) {
+    if (req->range) {
+        for (opt = req->range->reply; opt; opt = opt->next) {
 
             /*
              * Each complex option will be placed with one suboption,
@@ -1639,15 +1683,17 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
              * option with all suboptions
              */
 
-            if (opt->dict->parent) {
-                addOption(req, opt->dict->parent, opt->size + 2, NULL);
+            if (opt->dict->subcode) {
+                addOption(req, opt->dict->code, opt->size + 2, NULL);
+                addOption(req, opt->dict->subcode, opt->size, opt->ptr);
+            } else {
+                addOption(req, opt->dict->code, opt->size, opt->ptr);
             }
-            addOption(req, opt->dict->code, opt->size, opt->value.str);
         }
     }
     // We must return agent option back
     if (getOption(&req->in, DHCP_AGENT_OPTIONS, 0, &agent) != NULL) {
-        addOption(req, DHCP_AGENT_OPTIONS, agent.size, agent.value.str);
+        addOption(req, DHCP_AGENT_OPTIONS, agent.size, agent.ptr);
     }
     addOption(req, DHCP_END, 0, NULL);
     DHCPRequestReply(req);
@@ -1655,6 +1701,12 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
 
 static void DHCPProcessDiscover(DHCPRequest *req)
 {
+    req->range = DHCPRangeFind(req);
+
+    if (req->range == NULL || !DHCPRangeAlloc(req)) {
+        DHCPSendNAK(req);
+        return;
+    }
     DHCPSend(req, DHCP_OFFER);
 }
 
@@ -1697,9 +1749,190 @@ static void DHCPSendNAK(DHCPRequest *req)
     DHCPRequestReply(req);
 }
 
+static DHCPLease *DHCPLeaseCreate(u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires)
+{
+    DHCPLease *lease = NULL;
+
+    if (expires > time(0)) {
+        lease = (DHCPLease*)ns_calloc(1, sizeof(DHCPLease));
+        memcpy(lease->macaddr, macaddr, 12);
+        lease->ipaddr = ipaddr;
+        lease->expires = expires;
+        lease->lease_time = lease_time;
+        Ns_Log(Notice, "LeaseCreate: %s %s %u", addr2str(ipaddr), macaddr, lease_time);
+    }
+    return lease;
+}
+
+static DHCPLease *DHCPLeaseFind(DHCPRange *range, char *macaddr, u_int32_t ipaddr)
+{
+    DHCPLease *lease;
+    Tcl_HashSearch search;
+    Tcl_HashEntry *entry;
+
+    Ns_MutexLock(&range->lock);
+    entry = Tcl_FirstHashEntry(&range->leases, &search);
+    while (entry) {
+        lease = (DHCPLease*)Tcl_GetHashValue(entry);
+        if ((ipaddr && ipaddr == lease->ipaddr) ||
+            (*macaddr && !memcmp(macaddr, lease->macaddr, 12))) {
+            break;
+        }
+        entry = Tcl_NextHashEntry(&search);
+    }
+    Ns_MutexUnlock(&range->lock);
+    // Check lease validity
+    if (lease) {
+        if (lease->expires < time(0)) {
+            ns_free(lease);
+            lease = NULL;
+        }
+    }
+    return lease;
+}
+
+static int DHCPLeaseAdd(DHCPRange *range, DHCPLease *lease)
+{
+    int n = 0;
+    Tcl_HashEntry *entry;
+
+    if (lease != NULL) {
+        Ns_MutexLock(&range->lock);
+        entry = Tcl_CreateHashEntry(&range->leases, (char*)lease->ipaddr, &n);
+        if (n) {
+            Tcl_SetHashValue(entry, (ClientData)lease);
+        }
+        Ns_MutexUnlock(&range->lock);
+    }
+    return n;
+}
+
+static void DHCPLeaseList(DHCPRange *range, Ns_DString *ds)
+{
+    DHCPLease *lease;
+    Tcl_HashSearch search;
+    Tcl_HashEntry *entry;
+
+    Ns_MutexLock(&range->lock);
+    entry = Tcl_FirstHashEntry(&range->leases, &search);
+    while (entry) {
+        lease = (DHCPLease*)Tcl_GetHashValue(entry);
+        Ns_DStringPrintf(ds, "%s %s %u %u ", lease->macaddr, addr2str(lease->ipaddr), lease->lease_time, lease->expires);
+        entry = Tcl_NextHashEntry(&search);
+    }
+    Ns_MutexUnlock(&range->lock);
+}
+
+static void DHCPLeaseDel(DHCPRange *range, u_int32_t ipaddr)
+{
+    DHCPLease *lease;
+    Tcl_HashEntry *entry;
+
+    Ns_MutexLock(&range->lock);
+    entry = Tcl_FindHashEntry(&range->leases, (char *)ipaddr);
+    if (entry) {
+        lease = (DHCPLease*)Tcl_GetHashValue(entry);
+        Tcl_DeleteHashEntry(entry);
+        ns_free(lease);
+    }
+    Ns_MutexUnlock(&range->lock);
+}
+
+static DHCPRange *DHCPRangeFindFast(DHCPServer *srvPtr, u_int32_t ipaddr)
+{
+    DHCPRange *range;
+
+    Ns_MutexLock(&srvPtr->lock);
+    for (range = srvPtr->ranges; range; range = range->next) {
+        if (ipaddr >= range->start && ipaddr <= range->end) {
+            break;
+        }
+    }
+    Ns_MutexUnlock(&srvPtr->lock);
+    return range;
+}
+
+static DHCPRange *DHCPRangeFind(DHCPRequest *req)
+{
+    char rc, buf[32];
+    DHCPRange *range;
+    DHCPOption *opt, option;
+
+    bin2hex(buf, req->in.macaddr, 6);
+    Ns_MutexLock(&req->srvPtr->lock);
+    for (range = req->srvPtr->ranges; range; range = range->next) {
+        if ((req->in.yiaddr && req->in.yiaddr >= range->start && req->in.yiaddr <= range->end) ||
+            (range->macaddr[0] && !memcmp(buf, range->macaddr, 12))) {
+
+            for (opt = range->check; opt; opt = opt->next) {
+                if (getOption(&req->in, opt->dict->code, opt->dict->subcode, &option) == NULL) {
+                    break;
+                }
+                switch (opt->dict->flags & 0x00ff) {
+                case OPTION_BOOLEAN:
+                case OPTION_U8:
+                    rc = opt->value.u8 == option.value.u8 ? 0 : -1;
+                    break;
+
+                case OPTION_IPADDR:
+                case OPTION_U32:
+                case OPTION_S32:
+                    rc = opt->value.u32 == option.value.u32 ? 0 : -1;
+                    break;
+
+                case OPTION_S16:
+                case OPTION_U16:
+                    rc = opt->value.u16 == option.value.u16 ? 0 : -1;
+                    break;
+
+                default:
+                    rc = opt->size == option.size ? memcmp(option.ptr, opt->ptr, opt->size) : -1;
+                    break;
+                }
+                if (rc) {
+                    break;
+                }
+            }
+
+            /*
+             * If opt == NULL that means we scanned all options and all match or
+             * we do not have any check options for this range at all
+             */
+
+            if (opt == NULL) {
+                break;
+            }
+        }
+    }
+    Ns_MutexUnlock(&req->srvPtr->lock);
+    return range;
+}
+
+static int DHCPRangeAlloc(DHCPRequest *req)
+{
+    char buf[32];
+    u_int32_t ipaddr;
+    DHCPLease *lease = NULL;
+
+    Ns_MutexLock(&req->range->lock);
+    for (ipaddr = req->range->start; ipaddr <= req->range->end; ipaddr++) {
+        if (Tcl_FindHashEntry(&req->range->leases, (char *)ipaddr) == NULL) {
+            req->reply.yiaddr = ipaddr;
+            bin2hex(buf, req->in.macaddr, 6);
+            lease = DHCPLeaseCreate(ipaddr, buf, req->range->lease_time, time(0) + req->range->lease_time);
+            DHCPLeaseAdd(req->range, lease);
+            break;
+        }
+    }
+    Ns_MutexUnlock(&req->range->lock);
+    return lease ? 1 : 0;
+}
+
 static void DHCPRangeFree(DHCPRange *range)
 {
     DHCPOption *opt, *next;
+    Tcl_HashSearch search;
+    Tcl_HashEntry *entry;
 
     if (range == NULL) {
         return;
@@ -1707,64 +1940,24 @@ static void DHCPRangeFree(DHCPRange *range)
     opt = range->check;
     while (opt != NULL) {
         next = opt->next;
-        if ((opt->dict->flags & 0x00FF) == OPTION_STRING) {
-            ns_free(opt->value.str);
-        }
+        ns_free(opt->ptr);
         ns_free(opt);
         opt = next;
     }
     opt = range->reply;
     while (opt != NULL) {
         next = opt->next;
-        if ((opt->dict->flags & 0x00FF) == OPTION_STRING) {
-            ns_free(opt->value.str);
-        }
+        ns_free(opt->ptr);
         ns_free(opt);
         opt = next;
     }
+    entry = Tcl_FirstHashEntry(&range->leases, &search);
+    while (entry) {
+        ns_free(Tcl_GetHashValue(entry));
+        entry = Tcl_NextHashEntry(&search);
+    }
+    Tcl_DeleteHashTable(&range->leases);
     ns_free(range);
-}
-
-static DHCPLease *DHCPLeaseAdd(DHCPServer *srvPtr, char *macaddr, u_int32_t ipaddr, u_int32_t lease_time, u_int32_t expires)
-{
-    int n;
-    Tcl_HashEntry *entry;
-    DHCPLease *lease = NULL;
-
-    Ns_MutexLock(&srvPtr->lock);
-    entry = Tcl_CreateHashEntry(&srvPtr->leases.macaddr, macaddr, &n);
-    if (n) {
-        lease = (DHCPLease*)ns_calloc(1, sizeof(DHCPLease));
-        memcpy(lease->macaddr, macaddr, 12);
-        lease->ipaddr = ipaddr;
-        lease->lease_time = lease_time;
-        lease->expires = expires;
-        Tcl_SetHashValue(entry, (ClientData)lease);
-        entry = Tcl_CreateHashEntry(&srvPtr->leases.ipaddr, (char*)lease->ipaddr, &n);
-        Tcl_SetHashValue(entry, (ClientData)lease);
-    }
-    Ns_MutexUnlock(&srvPtr->lock);
-    return lease;
-}
-
-static void DHCPLeaseDel(DHCPServer *srvPtr, char *macaddr)
-{
-    DHCPLease *lease;
-    Tcl_HashEntry *entry;
-
-    Ns_MutexLock(&srvPtr->lock);
-    entry = Tcl_FindHashEntry(&srvPtr->leases.macaddr, macaddr);
-    if (entry == NULL) {
-        return;
-    }
-    lease = (DHCPLease*)Tcl_GetHashValue(entry);
-    Tcl_DeleteHashEntry(entry);
-    entry = Tcl_FindHashEntry(&srvPtr->leases.ipaddr, (char*)lease->ipaddr);
-    if (entry) {
-        Tcl_DeleteHashEntry(entry);
-    }
-    ns_free(lease);
-    Ns_MutexUnlock(&srvPtr->lock);
 }
 
 static char *addr2str(u_int32_t addr)
@@ -1880,110 +2073,6 @@ static void addOption(DHCPRequest *req, u_int8_t code, u_int8_t size, void *data
     }
 }
 
-static const char *getMessageName(u_int8_t type)
-{
-    int i;
-
-    for (i = 0; msgtypes[i].key; i++) {
-         if (msgtypes[i].value == type) {
-             return msgtypes[i].key;
-         }
-    }
-    return "unknown";
-}
-
-static u_int8_t getMessage(const char *name)
-{
-    int i;
-
-    for (i = 0; msgtypes[i].key; i++) {
-         if (!strcasecmp(msgtypes[i].key, name)) {
-             return msgtypes[i].value;
-         }
-    }
-    return 0;
-}
-
-static const char *getTypeName(u_int8_t type)
-{
-    switch (type & 0x00FF) {
-     case OPTION_IPADDR:
-         return "ipaddr";
-
-     case OPTION_BOOLEAN:
-         return "boolean";
-
-     case OPTION_U8:
-         return "ubyte";
-
-     case OPTION_S16:
-         return "short";
-
-     case OPTION_U16:
-         return "ushort";
-
-     case OPTION_U32:
-         return "uint";
-
-     case OPTION_S32:
-         return "int";
-    }
-    return "string";
-}
-
-static u_int8_t getTypeSize(u_int8_t type)
-{
-    switch (type & 0x00FF) {
-     case OPTION_IPADDR:
-         return 4;
-
-     case OPTION_BOOLEAN:
-         return 1;
-
-     case OPTION_U8:
-         return 1;
-
-     case OPTION_S16:
-         return 2;
-
-     case OPTION_U16:
-         return 2;
-
-     case OPTION_U32:
-         return 4;
-
-     case OPTION_S32:
-         return 4;
-    }
-    return 0;
-}
-
-static u_int8_t getType(const char *type)
-{
-    if (!strcasecmp(type, "ipaddr")) {
-        return OPTION_IPADDR;
-    }
-    if (!strcasecmp(type, "boolean")) {
-        return OPTION_BOOLEAN;
-    }
-    if (!strcasecmp(type, "byte")) {
-        return OPTION_U8;
-    }
-    if (!strcasecmp(type, "ushort")) {
-        return OPTION_U16;
-    }
-    if (!strcasecmp(type, "short")) {
-        return OPTION_S16;
-    }
-    if (!strcasecmp(type, "uint")) {
-        return OPTION_U32;
-    }
-    if (!strcasecmp(type, "int")) {
-        return OPTION_S32;
-    }
-    return OPTION_STRING;
-}
-
 /* get an option with bounds checking (warning, not aligned). */
 static u_int8_t *getOption(DHCPPacket *pkt, u_int8_t code, u_int8_t subcode, DHCPOption *opt)
 {
@@ -2008,18 +2097,41 @@ static u_int8_t *getOption(DHCPPacket *pkt, u_int8_t code, u_int8_t subcode, DHC
               if (subcode && dict[code].next != NULL) {
                   dict = dict[code].next;
                   length = size;
-                  code = subcode;
-                  subcode = 0;
                   i = 0;
                   continue;
               }
               if (opt) {
                   opt->size = size;
-                  opt->value.str = ptr + i + OFFSET_DATA;
                   opt->dict = &dict[code];
+                  opt->ptr = ptr + i + OFFSET_DATA;
+                  switch (dict[code].flags & 0x00ff) {
+                  case OPTION_IPADDR:
+                      opt->value.u32 = *((u_int32_t*)(ptr + i + OFFSET_DATA));
+                      break;
+
+                  case OPTION_BOOLEAN:
+                  case OPTION_U8:
+                      opt->value.u8 = *(ptr + i + OFFSET_DATA);
+                      break;
+
+                  case OPTION_S16:
+                      opt->value.s16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
+                      break;
+
+                  case OPTION_U16:
+                      opt->value.u16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
+                      break;
+
+                  case OPTION_U32:
+                      opt->value.u32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
+                      break;
+
+                  case OPTION_S32:
+                      opt->value.s32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
+                      break;
+                  }
               }
               return ptr + i + OFFSET_DATA;
-              break;
           }
           switch (ptr[i + OFFSET_CODE]) {
           case DHCP_PADDING:
@@ -2084,4 +2196,52 @@ static DHCPDict *getDict(const char *name)
         }
     }
     return NULL;
+}
+
+static const char *getMessageName(u_int8_t type)
+{
+    int i;
+
+    for (i = 0; msgtypes[i].key; i++) {
+         if (msgtypes[i].value == type) {
+             return msgtypes[i].key;
+         }
+    }
+    return "unknown";
+}
+
+static u_int8_t getMessageID(const char *name)
+{
+    int i;
+
+    for (i = 0; msgtypes[i].key; i++) {
+         if (!strcasecmp(msgtypes[i].key, name)) {
+             return msgtypes[i].value;
+         }
+    }
+    return 0;
+}
+
+static const char *getTypeName(u_int8_t type)
+{
+    type = (type & 0x00FF);
+    return opttypes[type <= OPTION_STRING ? type : 0].key;
+}
+
+static u_int8_t getTypeSize(u_int8_t type)
+{
+    type = (type & 0x00FF);
+    return opttypes[type <= OPTION_STRING ? type : 0].size;
+}
+
+static u_int8_t getTypeID(const char *type)
+{
+    int i;
+
+    for (i = 1; i <= OPTION_STRING; i++) {
+        if (!strcasecmp(type, opttypes[i].key)) {
+            return opttypes[i].type;
+         }
+    }
+    return OPTION_STRING;
 }
