@@ -256,6 +256,7 @@ typedef struct _dhcpRequest {
     char *buffer;
     u_int8_t msgtype;
     DHCPRange *range;
+    char macaddr[13];
     struct {
       u_int8_t msgtype;
       u_int32_t yiaddr;
@@ -294,10 +295,10 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type);
 static void DHCPSendNAK(DHCPRequest *req);
 static DHCPRange *DHCPRangeFind(DHCPRequest *req);
 static DHCPRange *DHCPRangeFindFast(DHCPServer *srvPtr, u_int32_t ipaddr);
-static int DHCPRangeAlloc(DHCPRequest *req);
 static void DHCPRangeFree(DHCPRange *range);
 static DHCPLease *DHCPLeaseCreate(u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires);
 static DHCPLease *DHCPLeaseFind(DHCPRange *range, u_int32_t ipaddr, char *macaddr);
+static DHCPLease *DHCPLeaseAlloc(DHCPRange *range);
 static int DHCPLeaseAdd(DHCPServer *srvPtr, u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires);
 static void DHCPLeaseDel(DHCPServer *srvPtr, u_int32_t ipaddr);
 static void DHCPLeaseList(DHCPRange *range, Ns_DString *ds);
@@ -1322,6 +1323,7 @@ static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, SOCKET sock, char *buf
 	}
         req = ns_calloc(1, sizeof(DHCPRequest));
         memcpy(&req->in, buffer, size);
+        bin2hex(req->macaddr, req->in.macaddr, 6);
         req->sock = dup(sock);
         req->srvPtr = srvPtr;
         req->buffer = buffer;
@@ -1447,7 +1449,7 @@ static int DHCPRequestProcess(DHCPRequest *req)
         break;
 
     default:
-    	Ns_Log(Debug, "nsdhcpd: unsupported msg type (%d) %s -- ignoring", req->msgtype, bin2hex(req->buffer, req->in.macaddr, 6));
+    	Ns_Log(Debug, "nsdhcpd: unsupported msg type (%d) %s -- ignoring", req->msgtype, req->macaddr);
     }
     return NS_TRUE;
 }
@@ -1715,17 +1717,36 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
 
 static void DHCPProcessDiscover(DHCPRequest *req)
 {
-    req->range = DHCPRangeFind(req);
+    DHCPLease *lease;
 
-    if (req->range == NULL || !DHCPRangeAlloc(req)) {
-        DHCPSendNAK(req);
+    req->range = DHCPRangeFind(req);
+    if (req->range == NULL ||
+        (!(lease = DHCPLeaseFind(req->range, 0, req->macaddr)) &&
+         !(lease = DHCPLeaseAlloc(req->range)))) {
         return;
     }
+    // Make it short till next REQUEST packet
+    req->reply.lease_time = 60;
+    lease->expires = time(0) + 60;
+    strcpy(lease->macaddr, req->macaddr);
+
+    req->reply.yiaddr = lease->ipaddr;
     DHCPSend(req, DHCP_OFFER);
 }
 
 static void DHCPProcessRequest(DHCPRequest *req)
 {
+    DHCPLease *lease;
+
+    req->range = DHCPRangeFind(req);
+    if (req->range == NULL || !(lease = DHCPLeaseFind(req->range, req->in.ciaddr, req->macaddr))) {
+        DHCPSendNAK(req);
+        return;
+    }
+    // Make normal lease time
+    req->reply.lease_time = lease->lease_time;
+    lease->expires = time(0) + lease->lease_time;
+
     req->reply.yiaddr = req->in.yiaddr;
     req->reply.siaddr = req->in.siaddr;
     DHCPSend(req, DHCP_ACK);
@@ -1733,6 +1754,11 @@ static void DHCPProcessRequest(DHCPRequest *req)
 
 static void DHCPProcessInform(DHCPRequest *req)
 {
+    req->range = DHCPRangeFind(req);
+    if (req->range == NULL) {
+        return;
+    }
+
     req->reply.yiaddr = req->in.yiaddr;
     req->reply.siaddr = req->in.siaddr;
     DHCPSend(req, DHCP_ACK);
@@ -1768,11 +1794,40 @@ static DHCPLease *DHCPLeaseCreate(u_int32_t ipaddr, char *macaddr, u_int32_t lea
     DHCPLease *lease = NULL;
 
     lease = (DHCPLease*)ns_calloc(1, sizeof(DHCPLease));
-    memcpy(lease->macaddr, macaddr, 12);
     lease->ipaddr = ipaddr;
     lease->expires = expires;
     lease->lease_time = lease_time;
+    if (macaddr != NULL) {
+        memcpy(lease->macaddr, macaddr, 12);
+    }
     Ns_Log(Notice, "LeaseCreate: %s %s %u", addr2str(ipaddr), macaddr, lease_time);
+    return lease;
+}
+
+static DHCPLease *DHCPLeaseAlloc(DHCPRange *range)
+{
+    u_int32_t n, ipaddr;
+    Tcl_HashEntry *entry;
+    DHCPLease *lease = NULL;
+
+    Ns_MutexLock(&range->lock);
+    for (ipaddr = range->start; ipaddr <= range->end; ipaddr++) {
+        entry = Tcl_FindHashEntry(&range->leases, (char *)ipaddr);
+        if (entry != NULL) {
+            if (lease->expires < time(0)) {
+                ns_free(Tcl_GetHashValue(entry));
+                Tcl_DeleteHashEntry(entry);
+                entry = NULL;
+            }
+        }
+        if (entry == NULL) {
+            lease = DHCPLeaseCreate(ipaddr, NULL, range->lease_time, time(0) + range->lease_time);
+            entry = Tcl_CreateHashEntry(&range->leases, (char*)lease->ipaddr, (int*)&n);
+            Tcl_SetHashValue(entry, (ClientData)lease);
+            break;
+        }
+    }
+    Ns_MutexUnlock(&range->lock);
     return lease;
 }
 
@@ -1783,14 +1838,19 @@ static DHCPLease *DHCPLeaseFind(DHCPRange *range, u_int32_t ipaddr, char *macadd
     Tcl_HashEntry *entry;
 
     Ns_MutexLock(&range->lock);
-    entry = Tcl_FirstHashEntry(&range->leases, &search);
-    while (entry) {
-        lease = (DHCPLease*)Tcl_GetHashValue(entry);
-        if ((ipaddr && ipaddr == lease->ipaddr) ||
-            (*macaddr && !memcmp(macaddr, lease->macaddr, 12))) {
-            break;
+    if (macaddr == NULL) {
+        entry = Tcl_FindHashEntry(&range->leases, (char*)ipaddr);
+
+    } else {
+        entry = Tcl_FirstHashEntry(&range->leases, &search);
+        while (entry) {
+            lease = (DHCPLease*)Tcl_GetHashValue(entry);
+            if ((ipaddr && ipaddr == lease->ipaddr) ||
+                (*macaddr && !memcmp(macaddr, lease->macaddr, 12))) {
+                break;
+            }
+            entry = Tcl_NextHashEntry(&search);
         }
-        entry = Tcl_NextHashEntry(&search);
     }
     Ns_MutexUnlock(&range->lock);
     // Check lease validity
@@ -1873,15 +1933,14 @@ static DHCPRange *DHCPRangeFindFast(DHCPServer *srvPtr, u_int32_t ipaddr)
 
 static DHCPRange *DHCPRangeFind(DHCPRequest *req)
 {
-    char rc, buf[32];
+    char rc;
     DHCPRange *range;
     DHCPOption *opt, option;
 
-    bin2hex(buf, req->in.macaddr, 6);
     Ns_MutexLock(&req->srvPtr->lock);
     for (range = req->srvPtr->ranges; range; range = range->next) {
         if ((req->in.yiaddr && req->in.yiaddr >= range->start && req->in.yiaddr <= range->end) ||
-            (range->macaddr[0] && !memcmp(buf, range->macaddr, 12))) {
+            (range->macaddr[0] && !memcmp(req->macaddr, range->macaddr, 12))) {
 
             for (opt = range->check; opt; opt = opt->next) {
                 if (getOption(&req->in, opt->dict->code, opt->dict->subcode, &option) == NULL) {
@@ -1925,37 +1984,6 @@ static DHCPRange *DHCPRangeFind(DHCPRequest *req)
     }
     Ns_MutexUnlock(&req->srvPtr->lock);
     return range;
-}
-
-static int DHCPRangeAlloc(DHCPRequest *req)
-{
-    char buf[32];
-    u_int32_t n, ipaddr;
-    Tcl_HashEntry *entry;
-    DHCPLease *lease = NULL;
-
-    Ns_MutexLock(&req->range->lock);
-    for (ipaddr = req->range->start; ipaddr <= req->range->end; ipaddr++) {
-        entry = Tcl_FindHashEntry(&req->range->leases, (char *)ipaddr);
-        if (entry != NULL) {
-            if (lease->expires < time(0)) {
-                ns_free(Tcl_GetHashValue(entry));
-                Tcl_DeleteHashEntry(entry);
-                entry = NULL;
-            }
-        }
-        if (entry == NULL) {
-            req->reply.yiaddr = ipaddr;
-            req->reply.lease_time = req->range->lease_time;
-            bin2hex(buf, req->in.macaddr, 6);
-            lease = DHCPLeaseCreate(ipaddr, buf, req->range->lease_time, time(0) + req->range->lease_time);
-            entry = Tcl_CreateHashEntry(&req->range->leases, (char*)lease->ipaddr, (int*)&n);
-            Tcl_SetHashValue(entry, (ClientData)lease);
-            break;
-        }
-    }
-    Ns_MutexUnlock(&req->range->lock);
-    return lease ? 1 : 0;
 }
 
 static void DHCPRangeFree(DHCPRange *range)
