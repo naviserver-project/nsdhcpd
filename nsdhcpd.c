@@ -212,7 +212,8 @@ typedef struct _dhcpLease {
 typedef struct _dhcpServer {
     int port;
     char *name;
-    char *proc;
+    char *run_proc;
+    char *trace_proc;
     char *address;
     char *interface;
     int sock;
@@ -295,6 +296,7 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type);
 static void DHCPSendNAK(DHCPRequest *req);
 static DHCPRange *DHCPRangeFind(DHCPRequest *req);
 static DHCPRange *DHCPRangeFindFast(DHCPServer *srvPtr, u_int32_t ipaddr);
+static void DHCPRangeList(DHCPRange *range, Ns_DString *ds);
 static void DHCPRangeFree(DHCPRange *range);
 static DHCPLease *DHCPLeaseCreate(u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires);
 static DHCPLease *DHCPLeaseFind(DHCPRange *range, u_int32_t ipaddr, char *macaddr);
@@ -302,6 +304,7 @@ static DHCPLease *DHCPLeaseAlloc(DHCPRange *range);
 static int DHCPLeaseAdd(DHCPServer *srvPtr, u_int32_t ipaddr, char *macaddr, u_int32_t lease_time, u_int32_t expires);
 static void DHCPLeaseDel(DHCPServer *srvPtr, u_int32_t ipaddr);
 static void DHCPLeaseList(DHCPRange *range, Ns_DString *ds);
+static DHCPOption *DHCPOptionCreate(const char *name, const char *value);
 static char *addr2str(u_int32_t addr);
 static char *str2mac(char *macaddr, char *str);
 static char *bin2hex(char *buf, u_int8_t *macaddr, int numbytes);
@@ -322,6 +325,7 @@ static const char *getMessageName(u_int8_t type);
 static Ns_Tls reqTls;
 
 static DHCPDict agent_dict[256] = {
+    { "agent.pad",                    0,				         82,          0,  0 },
     { "agent.circuit-id",             OPTION_STRING,				 82,          1,  0 },
     { "agent.remote-id",              OPTION_STRING,				 82,          2,  0 },
     { "agent.agent-id",               OPTION_IPADDR,				 82,          3,  0 },
@@ -643,8 +647,16 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     static int first = 0;
 
     if (!first) {
+        int i;
         Ns_TlsAlloc(&reqTls, NULL);
         first = 1;
+        for (i = 0; i < 256; i++) {
+            if (agent_dict[i].name == NULL) {
+                agent_dict[i].code = i;
+                agent_dict[i].subcode = 82;
+                agent_dict[i].flags = OPTION_STRING;
+            }
+        }
     }
 
     path = Ns_ConfigGetPath(server, module, NULL);
@@ -652,7 +664,8 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
     srvPtr->name = server;
     srvPtr->debug = Ns_ConfigIntRange(path, "debug", 0, 0, 65535);
     srvPtr->port = Ns_ConfigIntRange(path, "port", 67, 1, 65535);
-    srvPtr->proc = Ns_ConfigGetValue(path, "proc");
+    srvPtr->run_proc = Ns_ConfigGetValue(path, "proc");
+    srvPtr->trace_proc = Ns_ConfigGetValue(path, "trace_proc");
     srvPtr->address = Ns_ConfigGetValue(path, "address");
     srvPtr->drivermode = Ns_ConfigBool(path, "drivermode", 1);
     srvPtr->client.port = Ns_ConfigIntRange(path, "client_port", 68, 1, 65535);
@@ -689,7 +702,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
         }
         Ns_SockCallback(srvPtr->sock, DHCPSockProc, srvPtr, NS_SOCK_READ | NS_SOCK_EXIT | NS_SOCK_EXCEPTION);
         Ns_Log(Notice, "%s: listening on %s:%d with proc <%s>", module, srvPtr->address, srvPtr->port,
-                   srvPtr->proc ? srvPtr->proc : "");
+                   srvPtr->run_proc ? srvPtr->run_proc : "");
     }
 
     /*
@@ -752,14 +765,19 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
     Ns_DString ds;
 
     enum {
-        cmdDebug, cmdDictGet, cmdSend, cmdReqGet, cmdReqSet, cmdReqList,
-        cmdRangeAdd, cmdRangeList, cmdLeaseList, cmdLeaseAdd, cmdLeaseDel,
+        cmdDebug, cmdSend,
+        cmdDictGet, cmdDictList,
+        cmdReqGet, cmdReqSet, cmdReqList,
+        cmdRangeAdd, cmdRangeList,
+        cmdLeaseList, cmdLeaseAdd, cmdLeaseDel,
         cmdLeaseFind
     };
     static CONST char *subcmd[] = {
-        "debug", "dictget", "send", "reqget", "reqset", "reqlist",
-        "rangeadd", "rangelist", "leaselist", "leaseadd", "leasedel",
-        "leasefind",
+        "debug", "send",
+        "dictget", "dictlist",
+        "reqget", "reqset", "reqlist",
+        "rangeadd", "rangelist",
+        "leaselist", "leaseadd", "leasedel", "leasefind",
         NULL
     };
 
@@ -872,7 +890,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
 
     case cmdLeaseFind:
         if (objc < 3) {
-            Tcl_WrongNumArgs(interp, 2, objv, "ipaddr");
+            Tcl_WrongNumArgs(interp, 2, objv, "ipaddr ?macaddr?");
             return TCL_ERROR;
         }
         range = DHCPRangeFindFast(srvPtr, inet_addr(Tcl_GetString(objv[2])));
@@ -904,53 +922,16 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         Ns_DStringFree(&ds);
         break;
 
-    case cmdRangeList: {
-        DHCPOption *options[2];
-
+    case cmdRangeList:
         Ns_DStringInit(&ds);
         Ns_MutexLock(&srvPtr->lock);
         for (range = srvPtr->ranges; range; range = range->next) {
-            Ns_DStringPrintf(&ds, "%s ", addr2str(range->start));
-            Ns_DStringPrintf(&ds, "%s ", addr2str(range->end));
-            Ns_DStringPrintf(&ds, "%s ", range->macaddr);
-            options[0] = range->check;
-            options[1] = range->reply;
-            for (i = 0; i < 2; i++) {
-                Ns_DStringAppend(&ds, "{");
-                for (opt = options[i]; opt; opt = opt->next) {
-                    Ns_DStringPrintf(&ds, "%s ", opt->dict->name);
-                    switch (opt->dict->flags & 0x00ff) {
-                    case OPTION_IPADDR:
-                        Ns_DStringPrintf(&ds, "%s ", addr2str(opt->value.u32));
-                        break;
-
-                    case OPTION_BOOLEAN:
-                    case OPTION_U8:
-                        Ns_DStringPrintf(&ds, "%d ", (int)opt->value.u8);
-                        break;
-
-                    case OPTION_U32:
-                    case OPTION_S32:
-                        Ns_DStringPrintf(&ds, "%u ", opt->value.u32);
-                        break;
-
-                    case OPTION_S16:
-                    case OPTION_U16:
-                        Ns_DStringPrintf(&ds, "%d ", (int)opt->value.u16);
-                        break;
-
-                    default:
-                        Ns_DStringPrintf(&ds, "{%s} ", opt->ptr);
-                    }
-                }
-                Ns_DStringAppend(&ds, "} ");
-            }
+            DHCPRangeList(range, &ds);
         }
         Ns_MutexUnlock(&srvPtr->lock);
         Tcl_AppendResult(interp, ds.string, NULL);
         Ns_DStringFree(&ds);
         break;
-    }
 
     case cmdRangeAdd: {
         int j, argc;
@@ -997,49 +978,19 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
                 return TCL_ERROR;
             }
             for (i = 0; i < argc - 1; i += 2) {
-                dict = getDict(argv[i]);
-                if (dict == NULL) {
+                opt = DHCPOptionCreate(argv[i], argv[i+1]);
+                if (opt == NULL) {
                     DHCPRangeFree(range);
                     Tcl_Free((char *) argv);
                     Tcl_AppendResult(interp, "unknown option: ", argv[i], NULL);
                     return TCL_ERROR;
                 }
-                opt = (DHCPOption*)ns_malloc(sizeof(DHCPOption));
                 if (j == 0) {
                     opt->next = range->check;
                     range->check = opt;
                 } else {
                     opt->next = range->reply;
                     range->reply = opt;
-                }
-                opt->dict = dict;
-                switch (dict->flags & 0x00ff) {
-                case OPTION_BOOLEAN:
-                case OPTION_U8:
-                    opt->size = 1;
-                    opt->value.u8 = argv[i+1][0];
-                    break;
-
-                case OPTION_IPADDR:
-                    opt->size = 4;
-                    opt->value.u32 = inet_addr(argv[i+1]);
-                    break;
-
-                case OPTION_U32:
-                case OPTION_S32:
-                    opt->size = 4;
-                    opt->value.u32 = atoi(argv[i+1]);
-                    break;
-
-                case OPTION_S16:
-                case OPTION_U16:
-                    opt->size = 2;
-                    opt->value.u16 = atoi(argv[i+1]);
-                    break;
-
-                default:
-                    opt->ptr = (u_int8_t*)ns_strdup(argv[i+1]);
-                    opt->size = strlen(argv[i+1]);
                 }
             }
             Tcl_Free((char *) argv);
@@ -1067,6 +1018,28 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             Tcl_SetObjResult(interp, obj);
         }
         break;
+
+    case cmdDictList: {
+        int j;
+        Tcl_Obj *obj = Tcl_NewListObj(0, 0);
+        for (i = 1; i < 255; i++) {
+            Tcl_ListObjAppendElement(interp, obj, Tcl_NewStringObj(main_dict[i].name, -1));
+            Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(main_dict[i].code));
+            Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(main_dict[i].subcode));
+            Tcl_ListObjAppendElement(interp, obj, Tcl_NewStringObj(getTypeName(main_dict[i].flags), -1));
+            if (main_dict[i].next) {
+               dict = main_dict[i].next;
+               for (j = 1; j < 255; j++) {
+                   Tcl_ListObjAppendElement(interp, obj, Tcl_NewStringObj(dict[j].name, -1));
+                   Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(dict[j].code));
+                   Tcl_ListObjAppendElement(interp, obj, Tcl_NewIntObj(dict[j].subcode));
+                   Tcl_ListObjAppendElement(interp, obj, Tcl_NewStringObj(getTypeName(dict[i].flags), -1));
+               }
+            }
+        }
+        Tcl_SetObjResult(interp, obj);
+        break;
+    }
 
     case cmdReqGet:
         req = (DHCPRequest*)Ns_TlsGet(&reqTls);
@@ -1098,6 +1071,14 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
         } else
         if (!strcmp(Tcl_GetString(objv[2]), "ciaddr")) {
             Ns_DStringAppend(&ds, addr2str(req->in.ciaddr));
+        } else
+        if (!strcmp(Tcl_GetString(objv[2]), "range")) {
+            if (req->range != NULL) {
+                DHCPRangeList(req->range, &ds);
+            }
+        } else
+        if (!strcmp(Tcl_GetString(objv[i]), "lease_time")) {
+           Ns_DStringPrintf(&ds, "%u", req->reply.lease_time);
         } else {
             u_int8_t *ptr;
             dict = getDict(Tcl_GetString(objv[2]));
@@ -1394,6 +1375,9 @@ static int DHCPRequestRead(DHCPServer *srvPtr, SOCKET sock, char *buffer, int si
 
 static int DHCPRequestProcess(DHCPRequest *req)
 {
+    Tcl_Interp *interp = NULL;
+    int msgtype = req->msgtype;
+
     if (req->srvPtr->debug > 3) {
         Ns_DString ds;
         Ns_DStringInit(&ds);
@@ -1403,30 +1387,30 @@ static int DHCPRequestProcess(DHCPRequest *req)
         Ns_DStringFree(&ds);
     }
 
-    if (req->srvPtr->proc != NULL) {
-        Tcl_Interp *interp = Ns_TclAllocateInterp(req->srvPtr->name);
+    Ns_TlsSet(&reqTls, req);
 
-        Ns_TlsSet(&reqTls, req);
-        if (Tcl_EvalEx(interp, req->srvPtr->proc, -1, 0) != TCL_OK) {
+    if (req->srvPtr->run_proc != NULL) {
+        interp = Ns_TclAllocateInterp(req->srvPtr->name);
+        if (Tcl_EvalEx(interp, req->srvPtr->run_proc, -1, 0) != TCL_OK) {
             Ns_TclLogError(interp);
         }
-        Ns_TclDeAllocateInterp(interp);
-        Ns_TlsSet(&reqTls, 0);
 
         /* Script set reply code, we assume we are ready to return reply packet */
         switch (req->reply.msgtype) {
          case DHCP_ACK:
          case DHCP_OFFER:
              DHCPSend(req, DHCP_ACK);
-             return NS_TRUE;
+             msgtype = req->reply.msgtype;
+             break;
 
          case DHCP_NAK:
              DHCPSendNAK(req);
-             return NS_TRUE;
+             msgtype = req->reply.msgtype;
+             break;
         }
     }
 
-    switch (req->msgtype) {
+    switch (msgtype) {
     case DHCP_DISCOVER:
     	DHCPProcessDiscover(req);
     	break;
@@ -1449,8 +1433,23 @@ static int DHCPRequestProcess(DHCPRequest *req)
         break;
 
     default:
-    	Ns_Log(Debug, "nsdhcpd: unsupported msg type (%d) %s -- ignoring", req->msgtype, req->macaddr);
+    	Ns_Log(Debug, "nsdhcpd: unsupported msg type (%d) %s", req->msgtype, req->macaddr);
     }
+
+    // Postprocessing script
+    if (req->srvPtr->trace_proc != NULL) {
+        if (interp == NULL) {
+            interp = Ns_TclAllocateInterp(req->srvPtr->name);
+        }
+        if (Tcl_EvalEx(interp, req->srvPtr->trace_proc, -1, 0) != TCL_OK) {
+            Ns_TclLogError(interp);
+        }
+    }
+
+    if (interp != NULL) {
+        Ns_TclDeAllocateInterp(interp);
+    }
+    Ns_TlsSet(&reqTls, 0);
     return NS_TRUE;
 }
 
@@ -1553,7 +1552,7 @@ static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int
 
         case DHCP_OPTION_OVERLOAD:
              if (i + 1 + size >= length) {
-                 Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i, length);
+                 Ns_Log(Debug, "nsdhcpd: overload too long: code=%d, len=%d, %d > %d", code, size, i, length);
                  return;
              }
              over = ptr[i + 3];
@@ -1569,9 +1568,14 @@ static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int
              }
              return;
 
+        case DHCP_FQDN:
+             Ns_DStringPrintf(ds, "fqdn {%x %s} ", (int)*(ptr + 2), ptr + 4);
+             i += size + 2;
+             break;
+
         default:
              if (i + 1 + size >= length) {
-                 Ns_Log(Debug, "nsdhcpd: option field too long: code=%d, len=%d, %d > %d", code, size, i + 1 + size, length);
+                 Ns_Log(Debug, "nsdhcpd: option too long: code=%d, len=%d, %d > %d", code, size, i + 1 + size, length);
                  return;
              }
              if (info[code].next != NULL) {
@@ -1642,7 +1646,9 @@ static void DHCPPrintValue(Ns_DString *ds, char *name, u_int8_t type, u_int8_t s
 
 static void DHCPSend(DHCPRequest *req, u_int8_t type)
 {
-    DHCPOption *opt, agent;
+    int i;
+    DHCPOption *opt;
+    DHCPOption params, agent;
 
     switch (type) {
     case DHCP_DISCOVER:
@@ -1654,6 +1660,7 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
     default:
         req->out.op = BOOTREPLY;
     }
+    req->reply.msgtype = type;
     req->out.htype = ETH_10MB;
     req->out.hlen = ETH_10MB_LEN;
     req->out.xid = req->in.xid;
@@ -1689,9 +1696,27 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
         lease_time = req->reply.lease_time / 2 + req->reply.lease_time / 4;
         addOption32(req, DHCP_REBINDING_TIME, lease_time);
     }
+    params.size = 0;
+    getOption(&req->in, DHCP_PARAMETER_REQUEST_LIST, 0, &params);
+
     // Options from the range found
     if (req->range) {
         for (opt = req->range->reply; opt; opt = opt->next) {
+
+            /*
+             * If parameter list was provided, skip non-requested options
+             */
+
+            if (params.size > 0) {
+                for (i = 0; i < params.size; i++) {
+                    if (params.ptr[i] == opt->dict->code) {
+                       break;
+                    }
+                }
+                if (i >= params.size) {
+                    continue;
+                }
+            }
 
             /*
              * Each complex option will be placed with one suboption,
@@ -1739,7 +1764,10 @@ static void DHCPProcessRequest(DHCPRequest *req)
     DHCPLease *lease;
 
     req->range = DHCPRangeFind(req);
-    if (req->range == NULL || !(lease = DHCPLeaseFind(req->range, req->in.ciaddr, req->macaddr))) {
+    if (req->range == NULL) {
+        return;
+    }
+    if (!(lease = DHCPLeaseFind(req->range, req->in.ciaddr, req->macaddr))) {
         DHCPSendNAK(req);
         return;
     }
@@ -1770,6 +1798,7 @@ static void DHCPProcessRelease(DHCPRequest *req)
 
 static void DHCPSendNAK(DHCPRequest *req)
 {
+    req->reply.msgtype = DHCP_NAK;
     req->out.op = BOOTREPLY;
     req->out.htype = ETH_10MB;
     req->out.hlen = ETH_10MB_LEN;
@@ -1986,6 +2015,49 @@ static DHCPRange *DHCPRangeFind(DHCPRequest *req)
     return range;
 }
 
+static void DHCPRangeList(DHCPRange *range, Ns_DString *ds)
+{
+    int i;
+    char buf[256];
+    DHCPOption *opt, *options[2];
+
+    Ns_DStringPrintf(ds, "%s ", addr2str(range->start));
+    Ns_DStringPrintf(ds, "%s ", addr2str(range->end));
+    Ns_DStringPrintf(ds, "%s ", range->macaddr);
+    options[0] = range->check;
+    options[1] = range->reply;
+    for (i = 0; i < 2; i++) {
+        Ns_DStringAppend(ds, "{");
+        for (opt = options[i]; opt; opt = opt->next) {
+            Ns_DStringPrintf(ds, "%s ", opt->dict->name);
+            switch (opt->dict->flags & 0x00ff) {
+            case OPTION_IPADDR:
+                Ns_DStringPrintf(ds, "%s ", addr2str(opt->value.u32));
+                break;
+
+            case OPTION_BOOLEAN:
+            case OPTION_U8:
+                Ns_DStringPrintf(ds, "%d ", (int)opt->value.u8);
+                break;
+
+            case OPTION_U32:
+            case OPTION_S32:
+                Ns_DStringPrintf(ds, "%u ", opt->value.u32);
+                break;
+
+            case OPTION_S16:
+            case OPTION_U16:
+                Ns_DStringPrintf(ds, "%d ", (int)opt->value.u16);
+                break;
+
+            default:
+                Ns_DStringPrintf(ds, "{%s} ", bin2hex(buf, opt->ptr, opt->size));
+            }
+        }
+        Ns_DStringAppend(ds, "} ");
+    }
+}
+
 static void DHCPRangeFree(DHCPRange *range)
 {
     DHCPOption *opt, *next;
@@ -2016,6 +2088,55 @@ static void DHCPRangeFree(DHCPRange *range)
     }
     Tcl_DeleteHashTable(&range->leases);
     ns_free(range);
+}
+
+static DHCPOption *DHCPOptionCreate(const char *name, const char *value)
+{
+    DHCPOption *opt;
+    DHCPDict *dict;
+
+    dict = getDict(name);
+    if (dict == NULL) {
+        return NULL;
+    }
+    opt = (DHCPOption*)ns_malloc(sizeof(DHCPOption));
+    opt->dict = dict;
+    switch (dict->flags & 0x00ff) {
+    case OPTION_BOOLEAN:
+    case OPTION_U8:
+        opt->size = 1;
+        opt->value.u8 = value[0];
+        break;
+
+    case OPTION_IPADDR:
+        opt->size = 4;
+        opt->value.u32 = inet_addr(value);
+        break;
+
+    case OPTION_U32:
+    case OPTION_S32:
+        opt->size = 4;
+        opt->value.u32 = atoi(value);
+        break;
+
+    case OPTION_S16:
+    case OPTION_U16:
+        opt->size = 2;
+        opt->value.u16 = atoi(value);
+        break;
+
+    default:
+        opt->size = strlen(value);
+        if (!strncmp("hex://", value, 6)) {
+            opt->size -= 6;
+            opt->ptr = ns_calloc(1, opt->size * 2 + 1);
+            hex2bin(opt->ptr, (char*)(value + 6), opt->size);
+            opt->size *= 2;
+        } else {
+            opt->ptr = (u_int8_t*)ns_strdup(value);
+        }
+    }
+    return opt;
 }
 
 static char *addr2str(u_int32_t addr)
@@ -2155,38 +2276,49 @@ static u_int8_t *getOption(DHCPPacket *pkt, u_int8_t code, u_int8_t subcode, DHC
               if (subcode && dict[code].next != NULL) {
                   dict = dict[code].next;
                   length = size;
+                  ptr += i + OFFSET_DATA;
                   i = 0;
                   continue;
               }
               if (opt) {
                   opt->size = size;
                   opt->dict = &dict[code];
-                  opt->ptr = ptr + i + OFFSET_DATA;
-                  switch (dict[code].flags & 0x00ff) {
-                  case OPTION_IPADDR:
-                      opt->value.u32 = *((u_int32_t*)(ptr + i + OFFSET_DATA));
-                      break;
 
-                  case OPTION_BOOLEAN:
-                  case OPTION_U8:
-                      opt->value.u8 = *(ptr + i + OFFSET_DATA);
-                      break;
+                  switch (code) {
+                  case DHCP_FQDN:
+                       opt->size -= 3;
+                       opt->ptr = ptr + i + OFFSET_DATA + 3;
+                       opt->value.u8 = *(ptr + i + OFFSET_DATA);
+                       break;
 
-                  case OPTION_S16:
-                      opt->value.s16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
-                      break;
+                  default:
+                       opt->ptr = ptr + i + OFFSET_DATA;
+                       switch (dict[code].flags & 0x00ff) {
+                       case OPTION_IPADDR:
+                           opt->value.u32 = *((u_int32_t*)(ptr + i + OFFSET_DATA));
+                           break;
 
-                  case OPTION_U16:
-                      opt->value.u16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
-                      break;
+                       case OPTION_BOOLEAN:
+                       case OPTION_U8:
+                           opt->value.u8 = *(ptr + i + OFFSET_DATA);
+                           break;
 
-                  case OPTION_U32:
-                      opt->value.u32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
-                      break;
+                       case OPTION_S16:
+                           opt->value.s16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
+                           break;
 
-                  case OPTION_S32:
-                      opt->value.s32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
-                      break;
+                       case OPTION_U16:
+                           opt->value.u16 = ntohs(*((int16_t*)(ptr + i + OFFSET_DATA)));
+                           break;
+
+                       case OPTION_U32:
+                           opt->value.u32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
+                           break;
+
+                       case OPTION_S32:
+                           opt->value.s32 = ntohl(*((int32_t*)(ptr + i + OFFSET_DATA)));
+                           break;
+                       }
                   }
               }
               return ptr + i + OFFSET_DATA;
