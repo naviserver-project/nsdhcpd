@@ -1540,6 +1540,7 @@ static void DHCPPrintRequest(Ns_DString *ds, DHCPRequest *req, int reply)
 
 static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int length, DHCPDict *info)
 {
+    char buf[256];
     int i = 0, size, code, over = 0, mode = OPTION_FIELD;
 
     while (i < length) {
@@ -1569,7 +1570,13 @@ static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int
              return;
 
         case DHCP_FQDN:
-             Ns_DStringPrintf(ds, "fqdn {%x %s} ", (int)*(ptr + 2), ptr + 4);
+             //  Code   Len    Flags  RCODE1 RCODE2   Domain Name
+             // |  81  |   n  |      |      |      |       ...
+             //
+             //  0 1 2 3 4 5 6 7
+             //   MBZ   |N|E|O|S|
+
+             Ns_DStringPrintf(ds, "fqdn {%x %s} ", ptr[i + OFFSET_DATA], bin2hex(buf, ptr + i + OFFSET_DATA + 3, size - 3));
              i += size + 2;
              break;
 
@@ -2435,3 +2442,4 @@ static u_int8_t getTypeID(const char *type)
     }
     return OPTION_STRING;
 }
+
