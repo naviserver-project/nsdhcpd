@@ -267,6 +267,7 @@ typedef struct _dhcpRequest {
       u_int32_t broadcast;
       u_int32_t nameserver;
       u_int32_t lease_time;
+      DHCPOption *options;
     } reply;
     struct {
       u_int8_t *ptr;
@@ -1125,6 +1126,14 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             } else
             if (!strcmp(Tcl_GetString(objv[i]), "lease_time")) {
                 req->reply.lease_time = atol(Tcl_GetString(objv[i+1]));
+            } else {
+                opt = DHCPOptionCreate(Tcl_GetString(objv[i]), Tcl_GetString(objv[i+1]));
+                if (opt == NULL) {
+                    Tcl_AppendResult(interp, "unknown option: ", Tcl_GetString(objv[i]), NULL);
+                    return TCL_ERROR;
+                }
+                opt->next = req->reply.options;
+                req->reply.options = opt;
             }
         }
         break;
@@ -1653,9 +1662,10 @@ static void DHCPPrintValue(Ns_DString *ds, char *name, u_int8_t type, u_int8_t s
 
 static void DHCPSend(DHCPRequest *req, u_int8_t type)
 {
-    int i;
-    DHCPOption *opt;
+    int i, k;
+    char sent[256];
     DHCPOption params, agent;
+    DHCPOption *opt, *options[2];
 
     switch (type) {
     case DHCP_DISCOVER:
@@ -1684,17 +1694,25 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
     addOption(req, DHCP_VENDOR_CLASS_IDENTIFIER, 7, "nsdhcpd");
     addOptionIP(req, DHCP_SERVER_IDENTIFIER, req->srvPtr->ipaddr.sin_addr.s_addr);
 
+    // Keep track of what we sent already
+    sent[DHCP_MESSAGE_TYPE] = sent[DHCP_AGENT_OPTIONS] = 1;
+    sent[DHCP_SERVER_IDENTIFIER] = sent[DHCP_VENDOR_CLASS_IDENTIFIER] = 1;
+
     if (req->reply.gateway) {
         addOption32(req, DHCP_ROUTERS, req->reply.gateway);
+        sent[DHCP_ROUTERS] = 1;
     }
     if (req->reply.netmask) {
         addOption32(req, DHCP_SUBNET_MASK, req->reply.netmask);
+        sent[DHCP_SUBNET_MASK] = 1;
     }
     if (req->reply.broadcast) {
         addOption32(req, DHCP_BROADCAST_ADDRESS, req->reply.broadcast);
+        sent[DHCP_BROADCAST_ADDRESS] = 1;
     }
     if (req->reply.nameserver) {
         addOption32(req, DHCP_DOMAIN_NAME_SERVERS, req->reply.nameserver);
+        sent[DHCP_DOMAIN_NAME_SERVERS] = 1;
     }
     if (req->reply.lease_time) {
         int lease_time = req->reply.lease_time / 2;
@@ -1702,18 +1720,24 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
         addOption32(req, DHCP_RENEWAL_TIME, lease_time);
         lease_time = req->reply.lease_time / 2 + req->reply.lease_time / 4;
         addOption32(req, DHCP_REBINDING_TIME, lease_time);
+        sent[DHCP_LEASE_TIME] = sent[DHCP_RENEWAL_TIME] = sent[DHCP_REBINDING_TIME] = 1;
     }
     params.size = 0;
     getOption(&req->in, DHCP_PARAMETER_REQUEST_LIST, 0, &params);
 
-    // Options from the range found
-    if (req->range) {
-        for (opt = req->range->reply; opt; opt = opt->next) {
+    // Return all options
+    options[0] = req->reply.options;
+    options[1] = req->range->reply;
+    memset(sent, 0, sizeof(sent));
 
-            /*
-             * If parameter list was provided, skip non-requested options
-             */
+    for (k = 0; k < 2; k++) {
+        for (opt = options[k]; opt; opt = opt->next) {
 
+            if (sent[opt->dict->code]) {
+                continue;
+            }
+
+            // If parameter list was provided, skip not-requested options
             if (params.size > 0) {
                 for (i = 0; i < params.size; i++) {
                     if (params.ptr[i] == opt->dict->code) {
@@ -1724,6 +1748,7 @@ static void DHCPSend(DHCPRequest *req, u_int8_t type)
                     continue;
                 }
             }
+            sent[opt->dict->code] = 1;
 
             /*
              * Each complex option will be placed with one suboption,
@@ -1768,13 +1793,14 @@ static void DHCPProcessDiscover(DHCPRequest *req)
 
 static void DHCPProcessRequest(DHCPRequest *req)
 {
+    DHCPOption ipaddr;
     DHCPLease *lease;
 
     req->range = DHCPRangeFind(req);
-    if (req->range == NULL) {
+    if (req->range == NULL || !getOption(&req->in, DHCP_REQUESTED_ADDRESS, 0, &ipaddr)) {
         return;
     }
-    if (!(lease = DHCPLeaseFind(req->range, req->in.ciaddr, req->macaddr))) {
+    if (!(lease = DHCPLeaseFind(req->range, ipaddr.value.u32, req->macaddr))) {
         DHCPSendNAK(req);
         return;
     }
@@ -1910,9 +1936,10 @@ static int DHCPLeaseAdd(DHCPServer *srvPtr, u_int32_t ipaddr, char *macaddr, u_i
     if (range != NULL) {
         Ns_MutexLock(&range->lock);
         entry = Tcl_CreateHashEntry(&range->leases, (char*)ipaddr, &n);
-        if (n) {
-            Tcl_SetHashValue(entry, (ClientData)DHCPLeaseCreate(ipaddr, macaddr, lease_time, expires));
+        if (!n) {
+            ns_free(Tcl_GetHashValue(entry));
         }
+        Tcl_SetHashValue(entry, (ClientData)DHCPLeaseCreate(ipaddr, macaddr, lease_time, expires));
         Ns_MutexUnlock(&range->lock);
     }
     return n;
@@ -1936,7 +1963,6 @@ static void DHCPLeaseList(DHCPRange *range, Ns_DString *ds)
 
 static void DHCPLeaseDel(DHCPServer *srvPtr, u_int32_t ipaddr)
 {
-    DHCPLease *lease;
     DHCPRange *range;
     Tcl_HashEntry *entry;
 
@@ -1945,9 +1971,8 @@ static void DHCPLeaseDel(DHCPServer *srvPtr, u_int32_t ipaddr)
         Ns_MutexLock(&range->lock);
         entry = Tcl_FindHashEntry(&range->leases, (char *)ipaddr);
         if (entry) {
-            lease = (DHCPLease*)Tcl_GetHashValue(entry);
+            ns_free(Tcl_GetHashValue(entry));
             Tcl_DeleteHashEntry(entry);
-            ns_free(lease);
         }
         Ns_MutexUnlock(&range->lock);
     }
