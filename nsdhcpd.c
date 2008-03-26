@@ -1078,7 +1078,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
                 DHCPRangeList(req->range, &ds);
             }
         } else
-        if (!strcmp(Tcl_GetString(objv[i]), "lease_time")) {
+        if (!strcmp(Tcl_GetString(objv[2]), "lease_time")) {
            Ns_DStringPrintf(&ds, "%u", req->reply.lease_time);
         } else {
             u_int8_t *ptr;
@@ -1895,7 +1895,7 @@ static DHCPLease *DHCPLeaseAlloc(DHCPRange *range)
 
 static DHCPLease *DHCPLeaseFind(DHCPRange *range, u_int32_t ipaddr, char *macaddr)
 {
-    DHCPLease *lease;
+    DHCPLease *lease = NULL;
     Tcl_HashSearch search;
     Tcl_HashEntry *entry;
 
