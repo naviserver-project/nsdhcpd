@@ -170,7 +170,7 @@
 
 typedef struct _dhcpDict {
     char *name;
-    int flags;
+    unsigned int flags;
     int code;
     int subcode;
     struct _dhcpDict *next;
