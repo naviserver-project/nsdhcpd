@@ -1176,7 +1176,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
  *----------------------------------------------------------------------
  */
 
-static int DHCPSockProc(SOCKET sock, void *arg, int why)
+static int DHCPSockProc(SOCKET sock, void *arg, unsigned int why)
 {
     DHCPServer *srvPtr = (DHCPServer*)arg;
     struct sockaddr_in sa;
