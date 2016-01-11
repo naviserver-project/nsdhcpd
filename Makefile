@@ -10,7 +10,7 @@ MOD      =  nsdhcpd.so
 #
 # Objects to build.
 #
-OBJS     = nsdhcpd.o
+MODOBJS     = nsdhcpd.o
 
 include  $(NAVISERVER)/include/Makefile.module
 
