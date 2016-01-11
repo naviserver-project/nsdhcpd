@@ -279,11 +279,11 @@ static Ns_SockProc DHCPSockProc;
 static Ns_DriverProc DHCPDriverProc;
 static int DHCPInterpInit(Tcl_Interp * interp, void *arg);
 static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONST objv[]);
-static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, SOCKET sock, char *buffer, int size, struct sockaddr_in *sa);
+static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, NS_SOCKET sock, char *buffer, int size, struct sockaddr_in *sa);
 static int DHCPRequestProc(void *arg, Ns_Conn *conn);
 static int DHCPRequestProcess(DHCPRequest *req);
 static void DHCPRequestFree(DHCPRequest *req);
-static int DHCPRequestRead(DHCPServer *srvPtr, SOCKET sock, char *buffer, int size, struct sockaddr_in *sa);
+static int DHCPRequestRead(DHCPServer *srvPtr, NS_SOCKET sock, char *buffer, int size, struct sockaddr_in *sa);
 static int DHCPRequestReply(DHCPRequest *req);
 static void DHCPPrintRequest(Ns_DString *ds, DHCPRequest *req, int reply);
 static void DHCPPrintOptions(Ns_DString *ds, DHCPPacket *pkt, u_int8_t *ptr, int length, DHCPDict *info);
@@ -826,7 +826,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
             req->sa.sin_addr.s_addr = INADDR_BROADCAST;
         } else
         if (Ns_GetSockAddr(&req->sa, ipaddr, port) == NS_ERROR) {
-            close(req->sock);
+            (void) ns_sockclose(req->sock);
             DHCPRequestFree(req);
             Tcl_AppendResult(interp, "invalid address ", ipaddr, NULL);
             return TCL_ERROR;
@@ -1176,7 +1176,7 @@ static int DHCPCmd(ClientData arg, Tcl_Interp * interp, int objc, Tcl_Obj * CONS
  *----------------------------------------------------------------------
  */
 
-static int DHCPSockProc(SOCKET sock, void *arg, unsigned int why)
+static bool DHCPSockProc(NS_SOCKET sock, void *arg, unsigned int why)
 {
     DHCPServer *srvPtr = (DHCPServer*)arg;
     struct sockaddr_in sa;
@@ -1185,7 +1185,7 @@ static int DHCPSockProc(SOCKET sock, void *arg, unsigned int why)
     int size;
 
     if (why != NS_SOCK_READ) {
-        close(sock);
+        (void) ns_sockclose(sock);
         return NS_FALSE;
     }
     size = DHCPRequestRead(srvPtr, sock, buffer, sizeof(buffer), &sa);
@@ -1291,7 +1291,7 @@ static int DHCPRequestProc(void *arg, Ns_Conn *conn)
  *----------------------------------------------------------------------
  */
 
-static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, SOCKET sock, char *buffer, int size, struct sockaddr_in *sa)
+static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, NS_SOCKET sock, char *buffer, int size, struct sockaddr_in *sa)
 {
     u_int8_t *type;
     DHCPRequest *req = NULL;
@@ -1347,7 +1347,7 @@ static DHCPRequest *DHCPRequestCreate(DHCPServer *srvPtr, SOCKET sock, char *buf
  *----------------------------------------------------------------------
  */
 
-static int DHCPRequestRead(DHCPServer *srvPtr, SOCKET sock, char *buffer, int size, struct sockaddr_in *sa)
+static int DHCPRequestRead(DHCPServer *srvPtr, NS_SOCKET sock, char *buffer, int size, struct sockaddr_in *sa)
 {
     int len;
     socklen_t salen = sizeof(struct sockaddr_in);
@@ -2468,3 +2468,11 @@ static u_int8_t getTypeID(const char *type)
     return OPTION_STRING;
 }
 
+/*
+ * Local Variables:
+ * mode: c
+ * c-basic-offset: 4
+ * fill-column: 78
+ * indent-tabs-mode: nil
+ * End:
+ */
