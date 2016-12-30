@@ -640,7 +640,7 @@ NS_EXPORT int Ns_ModuleVersion = 1;
  *----------------------------------------------------------------------
  */
 
-NS_EXPORT int Ns_ModuleInit(char *server, char *module)
+NS_EXPORT int Ns_ModuleInit(const char *server, const char *module)
 {
     char *path;
     DHCPServer *srvPtr;
@@ -695,7 +695,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
         Ns_RegisterRequest(server, "DHCP",  "/", DHCPRequestProc, NULL, srvPtr, 0);
 
     } else {
-        srvPtr->sock = Ns_SockListenUdp(srvPtr->address, srvPtr->port);
+        srvPtr->sock = Ns_SockListenUdp(srvPtr->address, srvPtr->port, NS_FALSE);
         if (srvPtr->sock == -1) {
             Ns_Log(Error, "nsdhcpd: couldn't create socket: %s:%d: %s", srvPtr->address, srvPtr->port, strerror(errno));
             ns_free(srvPtr);
@@ -711,7 +711,7 @@ NS_EXPORT int Ns_ModuleInit(char *server, char *module)
      */
 
     if (srvPtr->client.port > 0) {
-        srvPtr->client.sock = Ns_SockListenUdp(srvPtr->address, srvPtr->client.port);
+        srvPtr->client.sock = Ns_SockListenUdp(srvPtr->address, srvPtr->client.port, NS_FALSE);
     }
     Ns_TclRegisterTrace(server, DHCPInterpInit, srvPtr, NS_TCL_TRACE_CREATE);
     return NS_OK;
